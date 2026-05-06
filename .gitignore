@@ -1,3 +1,7 @@
-﻿ghk-agent/
+﻿Scripts/
+ghk_poc/
+ghk_poc_ubuntu/
+bin/
+
 __pycache__/
 .env
