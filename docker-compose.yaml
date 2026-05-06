@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    container_name: ghk-poc-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ghk
+      POSTGRES_PASSWORD: ghk42
+      POSTGRES_DB: ghk_poc_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
