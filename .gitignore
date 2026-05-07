@@ -1,6 +1,8 @@
 ﻿Scripts/
 ghk_poc/
 ghk_poc_ubuntu/
+ghk_poc_ubuntu2/
+ghk_ubuntu/
 bin/
 
 __pycache__/
