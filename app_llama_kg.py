@@ -12,7 +12,9 @@ from schema import AgentResponse, InvestmentDetail
 from database import get_db_connection
 import asyncio
 import sys
-from langchain.chains import OntotextGraphDBQAChain 
+# from langchain_community.chains.graph_qa.ontotext_graphdb import OntotextGraphDBQAChain
+from langchain_classic.chains.graph_qa.ontotext_graphdb import OntotextGraphDBQAChain
+from langchain_community.graphs import OntotextGraphDBGraph
 
 try:
     loop = asyncio.get_running_loop()
@@ -39,7 +41,12 @@ def load_prompt(file_path):
     else:
         return "당신은 SQL 전문가 입니다. 질문에 맞는 SQL만 출력하세요."
 
-SQL_PROMPT = load_prompt("data_query_prompt.md")
+SQL_PROMPT = load_prompt("./prompts/data_query_prompt.md")
+print(SQL_PROMPT)
+GRAPH_PROMPT = load_prompt("./prompts/graph_query_prompt.md")
+print(GRAPH_PROMPT)
+ROUTER_PROMPT = load_prompt("./prompts/router_prompt.md")
+print(ROUTER_PROMPT)
 
 def extract_sql(text):
     """ 텍스트에서 SQL 쿼리를 추출 """
@@ -62,20 +69,32 @@ def extract_sql(text):
 @cl.on_chat_start
 async def start():
     try:
-        # DB 연결 및 LLM 초기화
-        db = get_db_connection()
-        # llm = ChatOpenAI(model="gpt-4", temperature=0, http_client=custom_http_client) # 분석 정밀도를 위해 0 설정
-        llm = ChatOllama(model="llama3-manual", temperature=0, streaming = True) # 분석 정밀도를 위해 0 설정
+        try:
+            # DB 연결 및 LLM 초기화
+            db = get_db_connection()
+            print(db.get_usable_table_names())
+        except Exception as e:
+            print(f"❌ 연결 실패: {e}\nPostgreSQL DB 연결 확인해주세요!")
 
-        graph = OntotextGraphDBGraph(
-            query_endpoint="http://localhost:7200/repositories/your-repo-id",
-            local_file = r"C:\Projects\fin-kg\ontology\fk_triples_v02.ttl"
-        )
+        try:
+            # llm = ChatOpenAI(model="gpt-4", temperature=0, http_client=custom_http_client) # 분석 정밀도를 위해 0 설정
+            llm = ChatOllama(model="llama3-manual", temperature=0, streaming = True) # 분석 정밀도를 위해 0 설정
+        except Exception as e:
+            print(f"❌ 연결 실패: {e}\nOllama가 켜져 있는지 확인해주세요!")
 
-        graph_chain = OntotextGraphDBQAChain.from_llm(llm, graph=graph)
-
+        try:
+            graph = OntotextGraphDBGraph(
+                query_endpoint="http://localhost:7200/repositories/etf-kg",
+                    local_file = r"C:\Projects\fin-kg\ontology\fk_triples_v02.ttl"
+                )
+            graph_chain = OntotextGraphDBQAChain.from_llm(llm, graph=graph, allow_dangerous_requests=True)
+        except Exception as e:
+            print(f"❌ 연결 실패: {e}\nGraphDB가 켜져 있는지 확인해주세요!")
 
         # SQL 생성 체인과 실행 도구 설정
+        if not db or not llm:
+            raise RuntimeError("필수 서비스(DB 또는 LLM)가 준비되지 않았습니다.")
+        
         execute_query = QuerySQLDataBaseTool(db=db)
         write_query = create_sql_query_chain(llm, db)
         
@@ -85,10 +104,11 @@ async def start():
         cl.user_session.set("llm", llm)
         cl.user_session.set("write_query", write_query)
         cl.user_session.set("execute_query", execute_query)
-
+        if graph_chain:
+            cl.user_session.set("graph_chain", graph_chain)
         await cl.Message(content="🚀 데이터 분석 에이전트가 가동되었습니다. 질문을 입력해주세요!").send()
     except Exception as e:
-        await cl.Message(content=f"❌ 연결 실패: {e}\nPostgreSQL Ubuntu 도커가 켜져 있는지 확인해주세요!").send()
+        await cl.Message(content=f"❌ 시스템 초기화 중 오류 발생: {e}\n 환경 설정을 확인해주세요!").send()
 
 @cl.on_message
 async def main(message: cl.Message):
@@ -96,7 +116,7 @@ async def main(message: cl.Message):
     execute_query = cl.user_session.get("execute_query")
     db = cl.user_session.get("db")
     llm = cl.user_session.get("llm")
-    full_prompt = f"""{SQL_PROMPT}\n\n사용자 질문: {message.content}"""
+    # full_prompt = f"""{SQL_PROMPT}\n\n사용자 질문: {message.content}"""
     graph_chain = cl.user_session.get("graph_chain") # start에서 저장했다고 가정
 
     # --- Step 1: 라우팅 (질문 분류) ---
@@ -110,17 +130,37 @@ async def main(message: cl.Message):
         # --- GraphDB(SPARQL) 경로 ---
         async with cl.Step(name="GraphDB 관계 분석") as step:
             cb = cl.AsyncLangchainCallbackHandler()
-            # OntotextGraphDBQAChain 실행
-            # Ollama의 경우 invoke를 비동기로 처리하기 위해 cl.make_async 사용
-            res = await cl.make_async(graph_chain.invoke)(
-                {"query": message.content},
-                config={"callbacks": [cb]}
-            )
-            data = res["result"]
-            step.output = f"GraphDB 분석 결과: {data}"
+
+            retry_count = 0
+            max_retries = 3
+            error_feedback = ""
+            while retry_count < max_retries:
+                try:
+                    # If error_feedback is exists, correct the error and try again
+                    if error_feedback:
+                        graph_question = f"{GRAPH_PROMPT}\n\n이전 시도 에러내용: {error_feedback}\n\n위 에러를 참고하여 다시 SPARQL 쿼리를 작성해줘. 사용자 질문: {message.content}"
+                    else:
+                        graph_question = f"{GRAPH_PROMPT}\n\n사용자 질문: {message.content}"
+
+                    res = await cl.make_async(graph_chain.invoke)({"query": graph_question}, config={"callbacks": [cb]})
+                    data = res["result"]
+                    step.output = f"GraphDB 분석 결과: {data} 시도: {retry_count + 1}"
+                    progress_msg = f"GraphDB 분석 결과: {data} 시도: {retry_count + 1}"
+                    await cl.Message(content=progress_msg).send()
+                    print(f"[성공] GraphDB 분석 완료.")
+                    break
+                except Exception as e:
+                    retry_count += 1
+                    error_feedback = f"⚠️ {retry_count}차 수정 중... 에러: {e}"
+                    await cl.Message(content=error_feedback).send()
+                    print(f"[에러] {e}")
+                    if retry_count == max_retries:
+                        await cl.Message(content="죄송합니다. GraphDB 분석에 실패했습니다.").send()
+                        return
     else: 
         # --- Node 1 & 2: SQL 생성 및 자기 수정(Reflection) ---
         async with cl.Step(name="SQL 생성 및 검증") as step:
+            full_prompt = f"{SQL_PROMPT}\n\n사용자 질문: {message.content}"
             retry_count = 0
             max_retries = 3
             raw_response = await llm.ainvoke(full_prompt)
@@ -166,6 +206,5 @@ async def main(message: cl.Message):
         prompt = f"질문: {message.content}\n데이터: {data}\n위 데이터를 바탕으로 분석해줘."
         # 실제 구현시에는 PydanticOutputParser를 사용하면 더욱 좋습니다.
         analysis = await llm.ainvoke(prompt)
-        step.output = analysis.content
-
-    await cl.Message(content=f"💡 분석이 완료되었습니다!\n\n{analysis.content}").send()
+        step.output = analysis.content    
+        await cl.Message(content=f"💡 분석이 완료되었습니다!\n\n{analysis.content}").send()
